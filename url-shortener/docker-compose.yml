@@ -1,0 +1,75 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  db:
+    image: postgres:15-alpine
+    container_name: urlshortener-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: urlshortener
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - urlshortener-network
+
+  # URL Shortener API
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: urlshortener-app
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      APP_ENV: development
+      APP_PORT: 8080
+      APP_BASE_URL: http://localhost:8080
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_NAME: urlshortener
+      DB_SSLMODE: disable
+      JWT_SECRET: dev-secret-key-change-in-production
+      JWT_EXPIRY: 24h
+    volumes:
+      - .:/app
+      - go_modules:/go/pkg/mod
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - urlshortener-network
+
+  # Database Admin UI (optional, for development)
+  adminer:
+    image: adminer:latest
+    container_name: urlshortener-adminer
+    restart: unless-stopped
+    ports:
+      - "8081:8080"
+    depends_on:
+      - db
+    networks:
+      - urlshortener-network
+
+volumes:
+  postgres_data:
+    driver: local
+  go_modules:
+    driver: local
+
+networks:
+  urlshortener-network:
+    driver: bridge
