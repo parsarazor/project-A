@@ -65,29 +65,33 @@ This URL Shortener service converts long URLs into short, manageable links. It p
 
 ## Architecture
 
-The project follows a **layered architecture** pattern within a monolithic structure:
+The project follows a **hexagonal architecture (ports and adapters)** in a **single monolith**.
 
 ```
-┌─────────────────────────────────────────────┐
-│                  Handlers                    │
-│         (HTTP Request/Response)              │
-├─────────────────────────────────────────────┤
-│                  Services                    │
-│            (Business Logic)                  │
-├─────────────────────────────────────────────┤
-│                Repositories                  │
-│            (Data Access Layer)               │
-├─────────────────────────────────────────────┤
-│                  Database                    │
-│              (PostgreSQL)                    │
-└─────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                  Primary Adapter (HTTP/Fiber)               │
+│         handlers + middleware map requests to use cases      │
+└──────────────────────────────┬───────────────────────────────┘
+                               │
+                               ▼
+┌──────────────────────────────────────────────────────────────┐
+│                Core (Application + Domain Rules)            │
+│   internal/core/usecase + internal/core/ports contracts     │
+└──────────────────────────────┬───────────────────────────────┘
+                               │
+                               ▼
+┌──────────────────────────────────────────────────────────────┐
+│      Secondary Adapters (DB/JWT/Bcrypt/ShortCode)           │
+│ repository (GORM), adapter/security, adapter/shortcode      │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-### Layer Responsibilities
+### What Matters
 
-- **Handlers**: HTTP request parsing, response formatting, input validation
-- **Services**: Business logic, data transformation, orchestration
-- **Repositories**: Database operations, queries, data persistence
+- **Dependency direction**: adapters depend on core, core does not depend on Fiber/GORM.
+- **Ports**: interfaces in `internal/core/ports` define what core needs.
+- **Use cases**: business rules live in `internal/core/usecase`.
+- **Composition root**: wiring is done in `cmd/*/main.go`.
 
 ## Database Schema
 
@@ -504,8 +508,23 @@ url-shortener/
 │   └── migrate/
 │       └── main.go              # Database migration tool
 ├── internal/
+│   ├── adapter/
+│   │   ├── security/
+│   │   │   ├── jwt_manager.go      # JWT adapter (TokenManager)
+│   │   │   └── bcrypt_hasher.go    # Password hasher adapter
+│   │   └── shortcode/
+│   │       └── random_generator.go # Short code generator adapter
 │   ├── config/
 │   │   └── config.go            # Configuration management
+│   ├── core/
+│   │   ├── ports/
+│   │   │   ├── user_repository.go  # Core contracts (ports)
+│   │   │   ├── url_repository.go
+│   │   │   ├── security.go
+│   │   │   └── shortcode.go
+│   │   └── usecase/
+│   │       ├── auth_usecase.go     # Core auth business rules
+│   │       └── url_usecase.go      # Core URL business rules
 │   ├── database/
 │   │   └── database.go          # Database connection
 │   ├── handler/
@@ -519,11 +538,11 @@ url-shortener/
 │   │   ├── user.go              # User model
 │   │   └── url.go               # URL model
 │   ├── repository/
-│   │   ├── user_repository.go   # User data access
-│   │   └── url_repository.go    # URL data access
+│   │   ├── user_repository.go   # GORM adapter for user port
+│   │   └── url_repository.go    # GORM adapter for URL port
 │   ├── service/
-│   │   ├── auth_service.go      # Auth business logic
-│   │   └── url_service.go       # URL business logic
+│   │   ├── auth_service.go      # Compatibility facade over use case
+│   │   └── url_service.go       # Compatibility facade over use case
 │   └── utils/
 │       ├── response.go          # HTTP response helpers
 │       ├── validator.go         # Input validation
