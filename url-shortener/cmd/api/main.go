@@ -5,10 +5,13 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
+	"github.com/gofiber/fiber/v2/middleware/limiter"
 	"github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/gofiber/fiber/v2/middleware/recover"
 	"github.com/url-shortener/internal/config"
@@ -20,7 +23,7 @@ import (
 )
 
 func main() {
-	// Load configuration
+	// Load configuration (fails fast on unsafe production settings)
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("Failed to load configuration: %v", err)
@@ -65,9 +68,17 @@ func main() {
 		Format: "[${time}] ${status} - ${latency} ${method} ${path}\n",
 	}))
 	app.Use(cors.New(cors.Config{
-		AllowOrigins: "*",
+		AllowOrigins: strings.Join(cfg.App.AllowedOrigins, ","),
 		AllowMethods: "GET,POST,PUT,PATCH,DELETE,OPTIONS",
 		AllowHeaders: "Origin,Content-Type,Accept,Authorization",
+	}))
+
+	// Global rate limit (per IP, per minute) - protects the public redirect
+	// and every other route from abusive traffic
+	app.Use(limiter.New(limiter.Config{
+		Max:               cfg.RateLimit.GlobalPerMinute,
+		Expiration:        time.Minute,
+		LimiterMiddleware: limiter.SlidingWindow{},
 	}))
 
 	// Health check endpoint
@@ -81,8 +92,13 @@ func main() {
 	// API v1 routes
 	api := app.Group("/api/v1")
 
-	// Auth routes (public)
-	auth := api.Group("/auth")
+	// Auth routes (public) - strict rate limit to slow down credential
+	// brute forcing
+	auth := api.Group("/auth", limiter.New(limiter.Config{
+		Max:               cfg.RateLimit.AuthPerMinute,
+		Expiration:        time.Minute,
+		LimiterMiddleware: limiter.SlidingWindow{},
+	}))
 	auth.Post("/register", authHandler.Register)
 	auth.Post("/login", authHandler.Login)
 
@@ -143,10 +159,15 @@ func customErrorHandler(c *fiber.Ctx, err error) error {
 	code := fiber.StatusInternalServerError
 	message := "Internal Server Error"
 
-	// Check if it's a Fiber error
+	// Check if it is a Fiber error
 	if e, ok := err.(*fiber.Error); ok {
 		code = e.Code
 		message = e.Message
+	}
+
+	// Rate limit responses should hint when to retry
+	if code == fiber.StatusTooManyRequests {
+		c.Set("Retry-After", "60")
 	}
 
 	// Return JSON error response

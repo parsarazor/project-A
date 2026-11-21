@@ -27,13 +27,18 @@ func Connect(cfg *config.Config) error {
 
 	var gormConfig *gorm.Config
 
+	// TranslateError maps driver-level errors (e.g. unique constraint
+	// violations) to gorm.ErrDuplicatedKey / gorm.ErrRecordNotFound so the
+	// repository layer can handle them without importing the driver.
 	if cfg.IsProduction() {
 		gormConfig = &gorm.Config{
-			Logger: logger.Default.LogMode(logger.Silent),
+			Logger:         logger.Default.LogMode(logger.Silent),
+			TranslateError: true,
 		}
 	} else {
 		gormConfig = &gorm.Config{
-			Logger: logger.Default.LogMode(logger.Info),
+			Logger:         logger.Default.LogMode(logger.Info),
+			TranslateError: true,
 		}
 	}
 

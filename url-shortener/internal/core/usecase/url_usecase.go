@@ -36,33 +36,28 @@ func (uc *URLUseCase) CreateShortURL(userID uuid.UUID, originalURL string) (*mod
 		return nil, ErrInvalidURL
 	}
 
-	var shortCode string
-	var err error
-	for i := 0; i < 10; i++ {
-		shortCode, err = uc.shortCodeGen.Generate(utils.DefaultCodeLength)
+	// Rely on the DB unique index to catch collisions: generate a code, insert,
+	// and retry with a new code on conflict. This is safe under concurrency,
+	// unlike a check-then-insert sequence.
+	url := &model.URL{OriginalURL: originalURL, UserID: userID, ClickCount: 0, IsActive: true}
+	const maxAttempts = 10
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		shortCode, err := uc.shortCodeGen.Generate(utils.DefaultCodeLength)
 		if err != nil {
 			return nil, err
 		}
+		url.ShortCode = shortCode
 
-		exists, err := uc.urlRepo.ShortCodeExists(shortCode)
-		if err != nil {
-			return nil, err
+		err = uc.urlRepo.Create(url)
+		if err == nil {
+			return url, nil
 		}
-
-		if !exists {
-			break
+		if errors.Is(err, ports.ErrAlreadyExist) {
+			continue
 		}
-
-		if i == 9 {
-			return nil, ErrShortCodeExists
-		}
-	}
-
-	url := &model.URL{ShortCode: shortCode, OriginalURL: originalURL, UserID: userID, ClickCount: 0, IsActive: true}
-	if err := uc.urlRepo.Create(url); err != nil {
 		return nil, err
 	}
-	return url, nil
+	return nil, ErrShortCodeExists
 }
 
 func (uc *URLUseCase) GetURLByShortCode(shortCode string) (*model.URL, error) {

@@ -1,24 +1,36 @@
 package config
 
 import (
+	"errors"
+	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/joho/godotenv"
 )
 
+// defaultJWTSecret is the fallback secret used outside production so that a
+// fresh checkout works out of the box. Production never accepts it.
+const defaultJWTSecret = "default-secret-change-in-production"
+
+// minJWTSecretLen is the minimum accepted JWT secret length in production.
+const minJWTSecretLen = 32
+
 // Config holds all configuration for the application
 type Config struct {
-	App      AppConfig
-	Database DatabaseConfig
-	JWT      JWTConfig
+	App       AppConfig
+	Database  DatabaseConfig
+	JWT       JWTConfig
+	RateLimit RateLimitConfig
 }
 
 // AppConfig holds application-specific configuration
 type AppConfig struct {
-	Env     string
-	Port    string
-	BaseURL string
+	Env            string
+	Port           string
+	BaseURL        string
+	AllowedOrigins []string
 }
 
 // DatabaseConfig holds database connection configuration
@@ -37,16 +49,27 @@ type JWTConfig struct {
 	Expiry time.Duration
 }
 
-// Load loads configuration from environment variables
+// RateLimitConfig holds per-IP rate limiting settings (requests per minute)
+type RateLimitConfig struct {
+	GlobalPerMinute int
+	AuthPerMinute   int
+}
+
+// Load loads configuration from environment variables and validates it
 func Load() (*Config, error) {
 	// Load .env file if it exists (ignore error if not found)
 	_ = godotenv.Load()
 
+	env := getEnv("APP_ENV", "development")
+	port := getEnv("APP_PORT", "8080")
+	baseURL := getEnv("APP_BASE_URL", "http://localhost:8080")
+
 	config := &Config{
 		App: AppConfig{
-			Env:     getEnv("APP_ENV", "development"),
-			Port:    getEnv("APP_PORT", "8080"),
-			BaseURL: getEnv("APP_BASE_URL", "http://localhost:8080"),
+			Env:            env,
+			Port:           port,
+			BaseURL:        baseURL,
+			AllowedOrigins: getAllowedOrigins(env, baseURL),
 		},
 		Database: DatabaseConfig{
 			Host:     getEnv("DB_HOST", "localhost"),
@@ -57,12 +80,37 @@ func Load() (*Config, error) {
 			SSLMode:  getEnv("DB_SSLMODE", "disable"),
 		},
 		JWT: JWTConfig{
-			Secret: getEnv("JWT_SECRET", "default-secret-change-in-production"),
+			Secret: getEnv("JWT_SECRET", defaultJWTSecret),
 			Expiry: parseDuration(getEnv("JWT_EXPIRY", "24h")),
+		},
+		RateLimit: RateLimitConfig{
+			GlobalPerMinute: getInt("RATE_LIMIT_GLOBAL", 300),
+			AuthPerMinute:   getInt("RATE_LIMIT_AUTH", 10),
 		},
 	}
 
+	if err := config.validate(); err != nil {
+		return nil, err
+	}
+
 	return config, nil
+}
+
+// validate fails fast on unsafe production configuration instead of booting
+// with insecure defaults
+func (c *Config) validate() error {
+	if c.IsProduction() {
+		if c.JWT.Secret == defaultJWTSecret {
+			return errors.New("JWT_SECRET must be set in production; generate one with: openssl rand -base64 48")
+		}
+		if len(c.JWT.Secret) < minJWTSecretLen {
+			return fmt.Errorf("JWT_SECRET must be at least %d characters in production", minJWTSecretLen)
+		}
+		if c.Database.Password == "" || c.Database.Password == "postgres" {
+			return errors.New("DB_PASSWORD must be set to a strong value in production")
+		}
+	}
+	return nil
 }
 
 // getEnv gets an environment variable or returns a default value
@@ -71,6 +119,37 @@ func getEnv(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+// getInt gets an environment variable as an integer or returns a default value
+func getInt(key string, defaultValue int) int {
+	if value := os.Getenv(key); value != "" {
+		var n int
+		if _, err := fmt.Sscanf(value, "%d", &n); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultValue
+}
+
+// getAllowedOrigins parses ALLOWED_ORIGINS (comma-separated). It defaults to
+// "*" in development and to the API's own base URL origin otherwise.
+func getAllowedOrigins(env, baseURL string) []string {
+	if raw := os.Getenv("ALLOWED_ORIGINS"); raw != "" {
+		var origins []string
+		for _, o := range strings.Split(raw, ",") {
+			if o = strings.TrimSpace(o); o != "" {
+				origins = append(origins, o)
+			}
+		}
+		if len(origins) > 0 {
+			return origins
+		}
+	}
+	if env == "development" {
+		return []string{"*"}
+	}
+	return []string{baseURL}
 }
 
 // parseDuration parses a duration string, returns default on error

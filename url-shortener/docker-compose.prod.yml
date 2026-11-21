@@ -13,21 +13,24 @@ services:
       - APP_ENV=production
       - APP_PORT=8080
       - APP_BASE_URL=${APP_BASE_URL:-http://localhost:8080}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-}
       - DB_HOST=db
       - DB_PORT=5432
       - DB_USER=${DB_USER:-postgres}
-      - DB_PASSWORD=${DB_PASSWORD:-postgres}
+      - DB_PASSWORD=${DB_PASSWORD:?DB_PASSWORD is required - set it in .env or the environment}
       - DB_NAME=${DB_NAME:-urlshortener}
       - DB_SSLMODE=disable
-      - JWT_SECRET=${JWT_SECRET}
+      - JWT_SECRET=${JWT_SECRET:?JWT_SECRET is required - generate one with: openssl rand -base64 48}
       - JWT_EXPIRY=${JWT_EXPIRY:-24h}
+      - RATE_LIMIT_GLOBAL=${RATE_LIMIT_GLOBAL:-300}
+      - RATE_LIMIT_AUTH=${RATE_LIMIT_AUTH:-10}
     depends_on:
       db:
         condition: service_healthy
     networks:
       - url-shortener-network
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      test: ["CMD", "/app/healthcheck"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -47,7 +50,7 @@ services:
     restart: unless-stopped
     environment:
       - POSTGRES_USER=${DB_USER:-postgres}
-      - POSTGRES_PASSWORD=${DB_PASSWORD:-postgres}
+      - POSTGRES_PASSWORD=${DB_PASSWORD:?DB_PASSWORD is required - set it in .env or the environment}
       - POSTGRES_DB=${DB_NAME:-urlshortener}
     volumes:
       - postgres_data_prod:/var/lib/postgresql/data

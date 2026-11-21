@@ -21,7 +21,13 @@ func NewURLRepository(db *gorm.DB) *URLRepository {
 }
 
 func (r *URLRepository) Create(url *model.URL) error {
-	return r.db.Create(url).Error
+	if err := r.db.Create(url).Error; err != nil {
+		if errors.Is(err, gorm.ErrDuplicatedKey) {
+			return ports.ErrAlreadyExist
+		}
+		return err
+	}
+	return nil
 }
 
 func (r *URLRepository) FindByID(id uuid.UUID) (*model.URL, error) {
