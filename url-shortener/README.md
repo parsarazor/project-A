@@ -482,12 +482,39 @@ docker-compose down
 ### Production
 
 ```bash
-# Build production image
-docker build -t url-shortener:latest -f Dockerfile.prod .
-
-# Run with production compose
-docker-compose -f docker-compose.prod.yml up -d
+# Build and start: migrations run automatically before the API starts
+docker compose -f docker-compose.prod.yml up -d --build
 ```
+
+On startup, Compose brings up three services in order:
+
+1. `db` — Postgres, started first; the others wait for its `pg_isready`
+   healthcheck.
+2. `migrate` — a one-shot container from the same image running `/app/migrate`
+   (schema `AutoMigrate`). The API does not start unless it exits successfully.
+3. `app` — the API itself.
+
+Re-running migrations after an image upgrade:
+
+```bash
+docker compose -f docker-compose.prod.yml run --rm migrate
+```
+
+Creating the first admin user (outside development the password must be
+provided explicitly and be at least 12 characters — a run without one, or with
+a publicly known default, fails fast instead of creating a weak admin):
+
+```bash
+docker compose -f docker-compose.prod.yml run --rm migrate \
+  -seed-admin \
+  -admin-email=admin@example.com \
+  -admin-password="$(openssl rand -base64 24)"
+```
+
+The password can also be supplied through the `ADMIN_PASSWORD` environment
+variable (e.g. in `.env`) instead of the `-admin-password` flag. In
+`APP_ENV=development` an empty password still falls back to the local dev
+default for convenience — that default is rejected everywhere else.
 
 ### Docker Commands via Makefile
 

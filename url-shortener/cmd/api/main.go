@@ -105,13 +105,9 @@ func main() {
 		KeyGenerator:      rateLimitKey(trustedNets),
 	}))
 
-	// Health check endpoint
-	app.Get("/health", func(c *fiber.Ctx) error {
-		return c.JSON(fiber.Map{
-			"status":  "healthy",
-			"version": version,
-		})
-	})
+	// Health endpoints: /health is a static liveness probe, /ready pings the
+	// database with a short timeout and reports 503 while it is unreachable.
+	handler.RegisterHealthHandlers(app, database.GetDB(), version)
 
 	// API v1 routes
 	api := app.Group("/api/v1")

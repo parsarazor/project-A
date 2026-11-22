@@ -1,13 +1,17 @@
 package unit
 
 import (
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/url-shortener/internal/adapter/security"
 	"github.com/url-shortener/internal/config"
+	"github.com/url-shortener/internal/core/ports"
+	"github.com/url-shortener/internal/core/usecase"
 	"github.com/url-shortener/internal/model"
 	"github.com/url-shortener/internal/repository"
 	"github.com/url-shortener/internal/service"
@@ -219,9 +223,11 @@ func TestAuthService_Login_InvalidCredentials(t *testing.T) {
 	})
 
 	t.Run("user not found", func(t *testing.T) {
-		// Simulate user not found scenario
+		// Simulate user not found scenario; repository.ErrUserNotFound is the
+		// shared ports.ErrNotFound instance so usecase/handler layers match it
+		// with errors.Is.
 		err := repository.ErrUserNotFound
-		assert.Equal(t, "user not found", err.Error())
+		assert.ErrorIs(t, err, ports.ErrNotFound)
 	})
 }
 
@@ -424,4 +430,26 @@ func TestUserModel(t *testing.T) {
 		assert.NoError(t, err)
 		assert.NotEqual(t, uuid.Nil, user.ID)
 	})
+}
+
+// TestLogin_DatabaseErrorNotMaskedAs401 verifies that a non-"not found" DB
+// failure during login propagates as-is (surfacing as 500) instead of being
+// mapped to ErrInvalidCredentials (401).
+func TestLogin_DatabaseErrorNotMaskedAs401(t *testing.T) {
+	cfg := createTestConfig()
+
+	mockRepo := new(MockUserRepository)
+	hasher := security.NewBcryptHasher()
+	tokens := security.NewJWTManager(cfg.JWT.Secret, cfg.JWT.Expiry)
+	uc := usecase.NewAuthUseCase(mockRepo, hasher, tokens)
+
+	req := &model.LoginRequest{Email: "dbdown@example.com", Password: "password123"}
+	dbErr := errors.New("sql: database is closed")
+	mockRepo.On("FindByEmail", req.Email).Return(nil, dbErr)
+
+	_, err := uc.Login(req)
+
+	assert.Error(t, err)
+	assert.ErrorIs(t, err, dbErr)
+	assert.NotErrorIs(t, err, usecase.ErrInvalidCredentials)
 }

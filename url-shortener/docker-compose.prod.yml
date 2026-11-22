@@ -7,6 +7,7 @@ services:
       dockerfile: Dockerfile.prod
       args:
         VERSION: ${VERSION:-dev}
+    image: url-shortener-api:${VERSION:-dev}
     container_name: url-shortener-prod
     restart: unless-stopped
     ports:
@@ -26,9 +27,14 @@ services:
       - JWT_EXPIRY=${JWT_EXPIRY:-24h}
       - RATE_LIMIT_GLOBAL=${RATE_LIMIT_GLOBAL:-300}
       - RATE_LIMIT_AUTH=${RATE_LIMIT_AUTH:-10}
+      # Allowlist of reverse-proxy IPs/CIDs (comma-separated) so client IPs
+      # (and therefore rate limiting) resolve correctly behind a load balancer.
+      - TRUSTED_PROXIES=${TRUSTED_PROXIES:-}
     depends_on:
       db:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     networks:
       - url-shortener-network
     healthcheck:
@@ -45,6 +51,35 @@ services:
         reservations:
           cpus: '0.25'
           memory: 128M
+
+  # One-shot schema migration: runs /app/migrate (AutoMigrate) against the
+  # database before the API starts, so a fresh volume is usable on first boot.
+  # Re-run manually after an image upgrade with:
+  #   docker compose -f docker-compose.prod.yml run --rm migrate
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile.prod
+      args:
+        VERSION: ${VERSION:-dev}
+    image: url-shortener-api:${VERSION:-dev}
+    container_name: url-shortener-migrate-prod
+    restart: "no"
+    entrypoint: ["/app/migrate"]
+    environment:
+      - APP_ENV=production
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_USER=${DB_USER:-postgres}
+      - DB_PASSWORD=${DB_PASSWORD:?DB_PASSWORD is required - set it in .env or the environment}
+      - DB_NAME=${DB_NAME:-urlshortener}
+      - DB_SSLMODE=${DB_SSLMODE:-disable}
+      - JWT_SECRET=${JWT_SECRET:?JWT_SECRET is required - generate one with: openssl rand -base64 48}
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - url-shortener-network
 
   db:
     image: postgres:15-alpine

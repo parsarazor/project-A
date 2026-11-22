@@ -1,5 +1,5 @@
 # Development Dockerfile for URL Shortener
-FROM golang:1.21-alpine
+FROM golang:1.26.11-alpine
 
 # Install necessary packages
 RUN apk add --no-cache git make curl

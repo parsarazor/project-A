@@ -2,11 +2,13 @@ package usecase
 
 import (
 	"errors"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/url-shortener/internal/core/ports"
 	"github.com/url-shortener/internal/model"
 	"github.com/url-shortener/internal/utils"
+	"gorm.io/gorm"
 )
 
 var (
@@ -35,7 +37,7 @@ func (uc *AuthUseCase) Register(req *model.RegisterRequest) (*model.User, error)
 		return nil, validator.Errors()
 	}
 
-	req.Email = utils.SanitizeString(req.Email)
+	req.Email = utils.SanitizeString(strings.ToLower(req.Email))
 	req.Name = utils.SanitizeString(req.Name)
 
 	exists, err := uc.userRepo.ExistsByEmail(req.Email)
@@ -59,6 +61,12 @@ func (uc *AuthUseCase) Register(req *model.RegisterRequest) (*model.User, error)
 	}
 
 	if err := uc.userRepo.Create(user); err != nil {
+		// Concurrent duplicate insert: the unique index on email rejected
+		// the write. Translate the port error to the domain error the
+		// handler maps to 409 Conflict.
+		if errors.Is(err, ports.ErrAlreadyExist) {
+			return nil, ErrUserAlreadyExists
+		}
 		return nil, err
 	}
 	return user, nil
@@ -72,9 +80,17 @@ func (uc *AuthUseCase) Login(req *model.LoginRequest) (*model.LoginResponse, err
 		return nil, validator.Errors()
 	}
 
+	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
+
 	user, err := uc.userRepo.FindByEmail(req.Email)
 	if err != nil {
-		return nil, ErrInvalidCredentials
+		// Only a genuine "not found" is a credentials error; any other DB
+		// failure (connection loss, timeout) must surface as a 500, not a
+		// misleading 401.
+		if errors.Is(err, ports.ErrNotFound) || errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrInvalidCredentials
+		}
+		return nil, err
 	}
 
 	if !uc.hasher.Compare(user.PasswordHash, req.Password) {
@@ -146,7 +162,7 @@ func (uc *AuthUseCase) CreateAdmin(email, password, name string) (*model.User, e
 		return nil, validator.Errors()
 	}
 
-	email = utils.SanitizeString(email)
+	email = utils.SanitizeString(strings.ToLower(email))
 	name = utils.SanitizeString(name)
 
 	exists, err := uc.userRepo.ExistsByEmail(email)
@@ -170,6 +186,9 @@ func (uc *AuthUseCase) CreateAdmin(email, password, name string) (*model.User, e
 	}
 
 	if err := uc.userRepo.Create(user); err != nil {
+		if errors.Is(err, ports.ErrAlreadyExist) {
+			return nil, ErrUserAlreadyExists
+		}
 		return nil, err
 	}
 

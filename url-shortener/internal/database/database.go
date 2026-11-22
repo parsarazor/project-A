@@ -3,6 +3,7 @@ package database
 import (
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/url-shortener/internal/config"
 	"github.com/url-shortener/internal/model"
@@ -55,9 +56,20 @@ func Connect(cfg *config.Config) error {
 		return fmt.Errorf("failed to get underlying DB: %w", err)
 	}
 
-	// Set connection pool settings
-	sqlDB.SetMaxIdleConns(10)
-	sqlDB.SetMaxOpenConns(100)
+	// Set connection pool settings. Postgres defaults to max_connections=100
+	// and the compose healthcheck (pg_isready) competes for the same budget,
+	// so the app pool stays well under it; lifetimes recycle stale
+	// connections behind load balancers and idle reapers.
+	const (
+		maxOpenConns    = 25
+		maxIdleConns    = 10
+		connMaxLifetime = 5 * time.Minute
+		connMaxIdleTime = 2 * time.Minute
+	)
+	sqlDB.SetMaxOpenConns(maxOpenConns)
+	sqlDB.SetMaxIdleConns(maxIdleConns)
+	sqlDB.SetConnMaxLifetime(connMaxLifetime)
+	sqlDB.SetConnMaxIdleTime(connMaxIdleTime)
 
 	DB = db
 	log.Println("Database connected successfully")

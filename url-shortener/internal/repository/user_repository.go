@@ -4,13 +4,14 @@ import (
 	"errors"
 
 	"github.com/google/uuid"
+	"github.com/url-shortener/internal/core/ports"
 	"github.com/url-shortener/internal/model"
 	"gorm.io/gorm"
 )
 
 var (
-	ErrUserNotFound      = errors.New("user not found")
-	ErrUserAlreadyExists = errors.New("user with this email already exists")
+	ErrUserNotFound      = ports.ErrNotFound
+	ErrUserAlreadyExists = ports.ErrAlreadyExist
 )
 
 // UserRepository handles database operations for users.
@@ -23,12 +24,13 @@ func NewUserRepository(db *gorm.DB) *UserRepository {
 }
 
 func (r *UserRepository) Create(user *model.User) error {
-	existing, err := r.FindByEmail(user.Email)
-	if err == nil && existing != nil {
-		return ErrUserAlreadyExists
-	}
-
 	if err := r.db.Create(user).Error; err != nil {
+		// The unique index on email is the source of truth: a concurrent
+		// insert between the caller's existence check and this write maps
+		// to ErrUserAlreadyExists (409) instead of surfacing as a 500.
+		if errors.Is(err, gorm.ErrDuplicatedKey) {
+			return ErrUserAlreadyExists
+		}
 		return err
 	}
 	return nil

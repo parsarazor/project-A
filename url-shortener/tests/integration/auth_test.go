@@ -3,8 +3,11 @@ package integration
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http/httptest"
+	"sort"
+	"sync"
 	"testing"
 	"time"
 
@@ -520,4 +523,169 @@ func (s *AuthTestSuite) registerAndLogin(email, password, name string) string {
 // TestAuthTestSuite runs the test suite
 func TestAuthTestSuite(t *testing.T) {
 	suite.Run(t, new(AuthTestSuite))
+}
+
+// TestRegistrationConcurrentSameEmail fires two concurrent registrations for
+// the same email and asserts exactly one 201, one 409 (never a 500) and a
+// single DB row.
+func TestRegistrationConcurrentSameEmail(t *testing.T) {
+	cfg := &config.Config{App: config.AppConfig{Env: "test"}}
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{TranslateError: true})
+	if err != nil {
+		t.Fatalf("failed to open sqlite: %v", err)
+	}
+	if err := db.AutoMigrate(&model.User{}); err != nil {
+		t.Fatalf("failed to migrate: %v", err)
+	}
+	// SQLite :memory: is per-connection; pin the pool to one connection so
+	// both requests share the same in-memory database and the second insert
+	// deterministically hits the unique index.
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("failed to get sql.DB: %v", err)
+	}
+	sqlDB.SetMaxOpenConns(1)
+
+	authService := service.NewAuthService(
+		repository.NewUserRepository(db),
+		cfg,
+	)
+	app := fiber.New(fiber.Config{
+		ErrorHandler: func(c *fiber.Ctx, err error) error {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+		},
+	})
+	app.Post("/api/v1/auth/register", handler.NewAuthHandler(authService).Register)
+
+	email := fmt.Sprintf("race-%d@example.com", time.Now().UnixNano())
+	const attempts = 2
+
+	type result struct {
+		status int
+	}
+	results := make([]result, attempts)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			<-start
+			body, _ := json.Marshal(model.RegisterRequest{
+				Email:    email,
+				Password: "sup3r-Secret!",
+				Name:     "Race User",
+			})
+			req := httptest.NewRequest("POST", "/api/v1/auth/register", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := app.Test(req, -1)
+			if err != nil {
+				t.Errorf("request %d failed: %v", idx, err)
+				return
+			}
+			results[idx] = result{status: resp.StatusCode}
+		}(i)
+	}
+
+	close(start)
+	wg.Wait()
+
+	statuses := []int{results[0].status, results[1].status}
+	sort.Ints(statuses)
+	assert.Equal(t, []int{fiber.StatusCreated, fiber.StatusConflict}, statuses,
+		"expected exactly one 201 and one 409, got %v", statuses)
+
+	var count int64
+	db.Model(&model.User{}).Where("email = ?", email).Count(&count)
+	assert.EqualValues(t, 1, count, "expected exactly one user row for %s", email)
+}
+
+// TestRegisterCaseInsensitiveDuplicateEmail asserts that registering with the
+// same email in a different case is rejected as a duplicate.
+func TestRegisterCaseInsensitiveDuplicateEmail(t *testing.T) {
+	cfg := &config.Config{App: config.AppConfig{Env: "test"}}
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{TranslateError: true})
+	if err != nil {
+		t.Fatalf("failed to open sqlite: %v", err)
+	}
+	if err := db.AutoMigrate(&model.User{}); err != nil {
+		t.Fatalf("failed to migrate: %v", err)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("failed to get sql.DB: %v", err)
+	}
+	sqlDB.SetMaxOpenConns(1)
+
+	authService := service.NewAuthService(repository.NewUserRepository(db), cfg)
+	app := fiber.New(fiber.Config{
+		ErrorHandler: func(c *fiber.Ctx, err error) error {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+		},
+	})
+	app.Post("/api/v1/auth/register", handler.NewAuthHandler(authService).Register)
+
+	register := func(email string) int {
+		body, _ := json.Marshal(model.RegisterRequest{
+			Email:    email,
+			Password: "sup3r-Secret!",
+			Name:     "Case User",
+		})
+		req := httptest.NewRequest("POST", "/api/v1/auth/register", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := app.Test(req, -1)
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		return resp.StatusCode
+	}
+
+	assert.Equal(t, fiber.StatusCreated, register("mixed@example.com"))
+	assert.Equal(t, fiber.StatusConflict, register("MIXED@example.com"),
+		"same email in another case must be rejected as duplicate, not create a second account")
+}
+
+// TestReadinessEndpoint asserts /health stays a static liveness endpoint while
+// /ready reports 200 with the DB up and 503 without it.
+func TestReadinessEndpoint(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{TranslateError: true})
+	if err != nil {
+		t.Fatalf("failed to open sqlite: %v", err)
+	}
+	if err := db.AutoMigrate(&model.User{}); err != nil {
+		t.Fatalf("failed to migrate: %v", err)
+	}
+
+	app := fiber.New()
+	handler.RegisterHealthHandlers(app, db, "")
+
+	resp, err := app.Test(httptest.NewRequest("GET", "/health", nil), -1)
+	if err != nil {
+		t.Fatalf("/health request failed: %v", err)
+	}
+	assert.Equal(t, fiber.StatusOK, resp.StatusCode, "/health must stay live while DB is up")
+
+	resp, err = app.Test(httptest.NewRequest("GET", "/ready", nil), -1)
+	if err != nil {
+		t.Fatalf("/ready request failed: %v", err)
+	}
+	assert.Equal(t, fiber.StatusOK, resp.StatusCode, "/ready must return 200 with a reachable DB")
+
+	// Close the DB to simulate an unreachable database.
+	if sqlDB, err := db.DB(); err == nil {
+		sqlDB.Close()
+	}
+
+	resp, err = app.Test(httptest.NewRequest("GET", "/health", nil), -1)
+	if err != nil {
+		t.Fatalf("/health request failed: %v", err)
+	}
+	assert.Equal(t, fiber.StatusOK, resp.StatusCode, "/health must stay a static liveness endpoint when the DB is down")
+
+	resp, err = app.Test(httptest.NewRequest("GET", "/ready", nil), -1)
+	if err != nil {
+		t.Fatalf("/ready request failed: %v", err)
+	}
+	assert.Equal(t, fiber.StatusServiceUnavailable, resp.StatusCode, "/ready must return 503 when the DB is unreachable")
 }

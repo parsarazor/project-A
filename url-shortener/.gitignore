@@ -5,7 +5,8 @@
 *.so
 *.dylib
 main
-migrate
+# Compiled migrate binary only (go build ./cmd/migrate) — never the source dir
+/migrate
 
 # Test binary, built with `go test -c`
 *.test
