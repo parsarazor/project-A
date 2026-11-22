@@ -24,7 +24,7 @@ This URL Shortener service converts long URLs into short, manageable links. It p
 
 ### Core Features
 - ✅ Convert long URLs to short codes
-- ✅ HTTP 301/302 redirects
+- ✅ HTTP 302 redirects
 - ✅ URL validation
 - ✅ Unique short code generation
 - ✅ Click/visit tracking
@@ -268,7 +268,7 @@ Authorization: Bearer <token>
 GET /{shortCode}
 ```
 
-**Response (301 Moved Permanently)**
+**Response (302 Found)**
 Redirects to the original URL.
 
 #### Admin Endpoints
@@ -401,6 +401,7 @@ Configuration is managed through environment variables or a config file.
 | `DB_SSLMODE` | Database SSL mode | disable |
 | `JWT_SECRET` | Secret key for JWT signing | (required) |
 | `JWT_EXPIRY` | Token expiry duration | 24h |
+| `TRUSTED_PROXIES` | Comma-separated proxy IPs/CIDRs trusted to set `X-Forwarded-For` (empty = trust nobody) | (empty) |
 
 ### Example .env File
 
@@ -416,7 +417,6 @@ DB_PASSWORD=postgres
 DB_NAME=urlshortener
 DB_SSLMODE=disable
 
-JWT_SECRET=your-super-secret-key-change-in-production
 JWT_EXPIRY=24h
 ```
 

@@ -17,7 +17,6 @@ type URLRepository interface {
 	Delete(id uuid.UUID) error
 	IncrementClickCount(id uuid.UUID) error
 	IncrementClickCountByShortCode(shortCode string) error
-	ShortCodeExists(shortCode string) (bool, error)
 	Deactivate(id uuid.UUID) error
 	Activate(id uuid.UUID) error
 	CountByUserID(userID uuid.UUID) (int64, error)

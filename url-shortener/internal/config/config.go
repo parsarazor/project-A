@@ -3,7 +3,9 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -14,8 +16,17 @@ import (
 // fresh checkout works out of the box. Production never accepts it.
 const defaultJWTSecret = "default-secret-change-in-production"
 
-// minJWTSecretLen is the minimum accepted JWT secret length in production.
+// minJWTSecretLen is the minimum accepted JWT secret length outside
+// development.
 const minJWTSecretLen = 32
+
+// knownWeakSecrets are publicly known values that must never be used as the
+// JWT secret outside development: the in-code fallback and the value that
+// used to ship in .env.example.
+var knownWeakSecrets = map[string]bool{
+	defaultJWTSecret: true,
+	"your-super-secret-key-change-in-production": true,
+}
 
 // Config holds all configuration for the application
 type Config struct {
@@ -31,6 +42,9 @@ type AppConfig struct {
 	Port           string
 	BaseURL        string
 	AllowedOrigins []string
+	// TrustedProxies lists proxy IPs/CIDRs whose X-Forwarded-For header is
+	// trusted when resolving the client IP. Empty trusts nobody.
+	TrustedProxies []string
 }
 
 // DatabaseConfig holds database connection configuration
@@ -64,12 +78,30 @@ func Load() (*Config, error) {
 	port := getEnv("APP_PORT", "8080")
 	baseURL := getEnv("APP_BASE_URL", "http://localhost:8080")
 
+	trustedProxies, err := getTrustedProxies()
+	if err != nil {
+		return nil, err
+	}
+	jwtExpiry, err := getDuration("JWT_EXPIRY", 24*time.Hour)
+	if err != nil {
+		return nil, err
+	}
+	globalPerMinute, err := getInt("RATE_LIMIT_GLOBAL", 300)
+	if err != nil {
+		return nil, err
+	}
+	authPerMinute, err := getInt("RATE_LIMIT_AUTH", 10)
+	if err != nil {
+		return nil, err
+	}
+
 	config := &Config{
 		App: AppConfig{
 			Env:            env,
 			Port:           port,
 			BaseURL:        baseURL,
 			AllowedOrigins: getAllowedOrigins(env, baseURL),
+			TrustedProxies: trustedProxies,
 		},
 		Database: DatabaseConfig{
 			Host:     getEnv("DB_HOST", "localhost"),
@@ -81,11 +113,11 @@ func Load() (*Config, error) {
 		},
 		JWT: JWTConfig{
 			Secret: getEnv("JWT_SECRET", defaultJWTSecret),
-			Expiry: parseDuration(getEnv("JWT_EXPIRY", "24h")),
+			Expiry: jwtExpiry,
 		},
 		RateLimit: RateLimitConfig{
-			GlobalPerMinute: getInt("RATE_LIMIT_GLOBAL", 300),
-			AuthPerMinute:   getInt("RATE_LIMIT_AUTH", 10),
+			GlobalPerMinute: globalPerMinute,
+			AuthPerMinute:   authPerMinute,
 		},
 	}
 
@@ -96,19 +128,20 @@ func Load() (*Config, error) {
 	return config, nil
 }
 
-// validate fails fast on unsafe production configuration instead of booting
-// with insecure defaults
+// validate fails fast on unsafe configuration in every environment except
+// development, instead of booting with insecure defaults
 func (c *Config) validate() error {
-	if c.IsProduction() {
-		if c.JWT.Secret == defaultJWTSecret {
-			return errors.New("JWT_SECRET must be set in production; generate one with: openssl rand -base64 48")
-		}
-		if len(c.JWT.Secret) < minJWTSecretLen {
-			return fmt.Errorf("JWT_SECRET must be at least %d characters in production", minJWTSecretLen)
-		}
-		if c.Database.Password == "" || c.Database.Password == "postgres" {
-			return errors.New("DB_PASSWORD must be set to a strong value in production")
-		}
+	if c.IsDevelopment() {
+		return nil
+	}
+	if knownWeakSecrets[c.JWT.Secret] {
+		return errors.New("JWT_SECRET is set to a publicly known value; generate a fresh one with: openssl rand -base64 48")
+	}
+	if len(c.JWT.Secret) < minJWTSecretLen {
+		return fmt.Errorf("JWT_SECRET must be at least %d characters unless APP_ENV=development", minJWTSecretLen)
+	}
+	if c.Database.Password == "" || c.Database.Password == "postgres" {
+		return errors.New("DB_PASSWORD must be set to a strong value unless APP_ENV=development")
 	}
 	return nil
 }
@@ -121,15 +154,18 @@ func getEnv(key, defaultValue string) string {
 	return defaultValue
 }
 
-// getInt gets an environment variable as an integer or returns a default value
-func getInt(key string, defaultValue int) int {
-	if value := os.Getenv(key); value != "" {
-		var n int
-		if _, err := fmt.Sscanf(value, "%d", &n); err == nil && n > 0 {
-			return n
-		}
+// getInt gets an environment variable as a positive integer; unset falls back
+// to the default, anything else invalid is an error
+func getInt(key string, defaultValue int) (int, error) {
+	value := os.Getenv(key)
+	if value == "" {
+		return defaultValue, nil
 	}
-	return defaultValue
+	n, err := strconv.Atoi(value)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("%s=%q must be a positive integer", key, value)
+	}
+	return n, nil
 }
 
 // getAllowedOrigins parses ALLOWED_ORIGINS (comma-separated). It defaults to
@@ -152,13 +188,41 @@ func getAllowedOrigins(env, baseURL string) []string {
 	return []string{baseURL}
 }
 
-// parseDuration parses a duration string, returns default on error
-func parseDuration(s string) time.Duration {
-	d, err := time.ParseDuration(s)
-	if err != nil {
-		return 24 * time.Hour
+// getDuration parses a duration environment variable; unset falls back to the
+// default, garbage and non-positive values are errors
+func getDuration(key string, defaultValue time.Duration) (time.Duration, error) {
+	value := os.Getenv(key)
+	if value == "" {
+		return defaultValue, nil
 	}
-	return d
+	d, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("%s=%q is not a valid duration (e.g. 24h, 30m)", key, value)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("%s=%q must be a positive duration", key, value)
+	}
+	return d, nil
+}
+
+// getTrustedProxies parses TRUSTED_PROXIES (comma-separated IPs or CIDRs).
+// An empty value trusts nobody: the client IP is always the direct peer.
+func getTrustedProxies() ([]string, error) {
+	raw := os.Getenv("TRUSTED_PROXIES")
+	if raw == "" {
+		return nil, nil
+	}
+	var proxies []string
+	for _, p := range strings.Split(raw, ",") {
+		if p = strings.TrimSpace(p); p == "" {
+			continue
+		}
+		if _, _, err := net.ParseCIDR(p); err != nil && net.ParseIP(p) == nil {
+			return nil, fmt.Errorf("TRUSTED_PROXIES: %q is not a valid IP or CIDR", p)
+		}
+		proxies = append(proxies, p)
+	}
+	return proxies, nil
 }
 
 // IsDevelopment returns true if the app is running in development mode

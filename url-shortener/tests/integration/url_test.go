@@ -3,6 +3,7 @@ package integration
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http/httptest"
 	"testing"
@@ -13,6 +14,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
 	"github.com/url-shortener/internal/config"
+	"github.com/url-shortener/internal/core/usecase"
 	"github.com/url-shortener/internal/handler"
 	"github.com/url-shortener/internal/middleware"
 	"github.com/url-shortener/internal/model"
@@ -50,8 +52,10 @@ func (s *URLTestSuite) SetupSuite() {
 		},
 	}
 
-	// Setup in-memory SQLite database for testing
-	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	// Setup in-memory SQLite database for testing.
+	// TranslateError makes duplicate keys surface as gorm.ErrDuplicatedKey,
+	// matching how the production Postgres connection is configured.
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{TranslateError: true})
 	s.Require().NoError(err)
 
 	// Run migrations
@@ -125,6 +129,9 @@ func (s *URLTestSuite) setupRoutes() {
 
 // TearDownSuite runs once after all tests in the suite
 func (s *URLTestSuite) TearDownSuite() {
+	// Stop the click counter and drain queued writes before closing the DB
+	s.urlService.Close()
+
 	sqlDB, err := s.db.DB()
 	if err == nil {
 		sqlDB.Close()
@@ -311,8 +318,8 @@ func (s *URLTestSuite) TestRedirect_Success() {
 	resp, err := s.app.Test(req, -1)
 	s.Require().NoError(err)
 
-	// Should be a redirect (301)
-	assert.Equal(s.T(), fiber.StatusMovedPermanently, resp.StatusCode)
+	// Should be a temporary redirect (302)
+	assert.Equal(s.T(), fiber.StatusFound, resp.StatusCode)
 	assert.Equal(s.T(), "https://www.google.com", resp.Header.Get("Location"))
 }
 
@@ -330,6 +337,77 @@ func (s *URLTestSuite) TestRedirect_InvalidShortCode() {
 
 	resp, _ := s.app.Test(req, -1)
 	assert.Equal(s.T(), fiber.StatusNotFound, resp.StatusCode)
+}
+
+// TestRedirect_IncrementsClickCount verifies the redirect path end-to-end:
+// the click count is queued asynchronously and lands in the DB after drain.
+func (s *URLTestSuite) TestRedirect_IncrementsClickCount() {
+	token := s.registerAndLogin("clickcount@example.com", "password123", "Click Count User")
+
+	reqBody := model.CreateURLRequest{OriginalURL: "https://www.example.com/clicks"}
+	body, _ := json.Marshal(reqBody)
+	req := httptest.NewRequest("POST", "/api/v1/urls", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, _ := s.app.Test(req, -1)
+	respBody, _ := io.ReadAll(resp.Body)
+	var createResponse map[string]interface{}
+	json.Unmarshal(respBody, &createResponse)
+	data := createResponse["data"].(map[string]interface{})
+	shortCode := data["short_code"].(string)
+
+	for i := 0; i < 3; i++ {
+		s.Require().NoError(s.urlService.IncrementClickCount(shortCode))
+	}
+
+	var url model.URL
+	err := s.db.Where("short_code = ?", shortCode).First(&url).Error
+	s.Require().NoError(err)
+	assert.Equal(s.T(), int64(3), url.ClickCount)
+}
+
+// TestCreateURL_RetriesOnShortCodeCollision verifies that a duplicate short
+// code (unique-index conflict, translated like production Postgres) is
+// retried with a fresh code instead of failing the request.
+func (s *URLTestSuite) TestCreateURL_RetriesOnShortCodeCollision() {
+	token := s.registerAndLogin("collision@example.com", "password123", "Collision User")
+
+	reqBody := model.CreateURLRequest{OriginalURL: "https://www.example.com/first"}
+	body, _ := json.Marshal(reqBody)
+	req := httptest.NewRequest("POST", "/api/v1/urls", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, _ := s.app.Test(req, -1)
+	s.Require().Equal(fiber.StatusCreated, resp.StatusCode)
+	respBody, _ := io.ReadAll(resp.Body)
+	var createResponse map[string]interface{}
+	json.Unmarshal(respBody, &createResponse)
+	firstCode := createResponse["data"].(map[string]interface{})["short_code"].(string)
+
+	// Force a deterministic collision: the first generated code already
+	// exists, the second is fresh; the use case must retry past the conflict.
+	gen := &seqGenerator{codes: []string{firstCode, "fresh1"}}
+	uc := usecase.NewURLUseCase(
+		repository.NewURLRepository(s.db), gen, s.cfg.App.BaseURL,
+	)
+
+	url, err := uc.CreateShortURL(uuid.New(), "https://www.example.com/second")
+
+	s.Require().NoError(err)
+	assert.NotEqual(s.T(), firstCode, url.ShortCode)
+	assert.Equal(s.T(), "fresh1", url.ShortCode)
+}
+
+// seqGenerator returns preset codes in order, for deterministic collisions.
+type seqGenerator struct{ codes []string }
+
+func (g *seqGenerator) Generate(length int) (string, error) {
+	if len(g.codes) == 0 {
+		return "", errors.New("codes exhausted")
+	}
+	code := g.codes[0]
+	g.codes = g.codes[1:]
+	return code, nil
 }
 
 // TestDeleteURL_Success tests successful URL deletion

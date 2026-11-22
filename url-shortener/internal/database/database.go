@@ -32,7 +32,9 @@ func Connect(cfg *config.Config) error {
 	// repository layer can handle them without importing the driver.
 	if cfg.IsProduction() {
 		gormConfig = &gorm.Config{
-			Logger:         logger.Default.LogMode(logger.Silent),
+			// Error mode: log only failures (not queries) so DB outages are
+			// visible in production logs without per-request query noise.
+			Logger:         logger.Default.LogMode(logger.Error),
 			TranslateError: true,
 		}
 	} else {

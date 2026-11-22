@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"strings"
@@ -22,8 +23,12 @@ import (
 	"github.com/url-shortener/internal/service"
 )
 
+// version is the application version, injected at build time with
+// -ldflags "-X main.version=..." (dev otherwise).
+var version = "dev"
+
 func main() {
-	// Load configuration (fails fast on unsafe production settings)
+	// Load configuration (fails fast on unsafe settings outside development)
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("Failed to load configuration: %v", err)
@@ -57,10 +62,28 @@ func main() {
 	authMiddleware := middleware.NewAuthMiddleware(authService)
 
 	// Create Fiber app
-	app := fiber.New(fiber.Config{
+	fiberConfig := fiber.Config{
 		AppName:      "URL Shortener API",
 		ErrorHandler: customErrorHandler,
-	})
+		// Cap slowloris-style abuse: fail clients that cannot send or accept
+		// data in a reasonable time, and reject oversized bodies.
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  75 * time.Second,
+		BodyLimit:    1 << 20, // 1 MiB; requests are tiny JSON documents
+	}
+	// Only honor spoofable forwarded headers when the direct peer is an
+	// explicitly configured proxy; otherwise c.IP() stays the peer address.
+	// The rate limiters below additionally walk X-Forwarded-For right-to-left
+	// so a spoofed header cannot rotate the limit key.
+	trustedNets := trustedProxyNets(cfg.App.TrustedProxies)
+	if len(trustedNets) > 0 {
+		fiberConfig.EnableTrustedProxyCheck = true
+		fiberConfig.TrustedProxies = cfg.App.TrustedProxies
+		fiberConfig.ProxyHeader = fiber.HeaderXForwardedFor
+		fiberConfig.EnableIPValidation = true
+	}
+	app := fiber.New(fiberConfig)
 
 	// Global middleware
 	app.Use(recover.New())
@@ -79,31 +102,38 @@ func main() {
 		Max:               cfg.RateLimit.GlobalPerMinute,
 		Expiration:        time.Minute,
 		LimiterMiddleware: limiter.SlidingWindow{},
+		KeyGenerator:      rateLimitKey(trustedNets),
 	}))
 
 	// Health check endpoint
 	app.Get("/health", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{
 			"status":  "healthy",
-			"version": "1.0.0",
+			"version": version,
 		})
 	})
 
 	// API v1 routes
 	api := app.Group("/api/v1")
 
-	// Auth routes (public) - strict rate limit to slow down credential
-	// brute forcing
-	auth := api.Group("/auth", limiter.New(limiter.Config{
+	// Strict rate limit for the credential endpoints (per IP, per minute) -
+	// slows down brute forcing without throttling the authenticated /auth
+	// routes
+	authLimiter := limiter.New(limiter.Config{
 		Max:               cfg.RateLimit.AuthPerMinute,
 		Expiration:        time.Minute,
 		LimiterMiddleware: limiter.SlidingWindow{},
-	}))
-	auth.Post("/register", authHandler.Register)
-	auth.Post("/login", authHandler.Login)
+		KeyGenerator:      rateLimitKey(trustedNets),
+	})
 
-	// Auth routes (protected)
-	authProtected := auth.Group("", authMiddleware.Authenticate())
+	// Auth routes (public) - only the credential endpoints are strictly
+	// rate limited
+	authPublic := api.Group("/auth")
+	authPublic.Post("/register", authLimiter, authHandler.Register)
+	authPublic.Post("/login", authLimiter, authHandler.Login)
+
+	// Auth routes (protected) - not under the strict credential limiter
+	authProtected := api.Group("/auth", authMiddleware.Authenticate())
 	authProtected.Get("/me", authHandler.GetMe)
 	authProtected.Post("/change-password", authHandler.ChangePassword)
 
@@ -150,7 +180,64 @@ func main() {
 		log.Fatalf("Server forced to shutdown: %v", err)
 	}
 
+	// Stop the click counter and wait for queued writes to drain
+	urlService.Close()
+
 	log.Println("Server exited properly")
+}
+
+// trustedProxyNets parses configured proxies (IPs or CIDRs) into networks.
+func trustedProxyNets(proxies []string) []*net.IPNet {
+	nets := make([]*net.IPNet, 0, len(proxies))
+	for _, p := range proxies {
+		if _, ipnet, err := net.ParseCIDR(p); err == nil {
+			nets = append(nets, ipnet)
+			continue
+		}
+		if ip := net.ParseIP(p); ip != nil {
+			bits := 32
+			if ip.To4() == nil {
+				bits = 128
+			}
+			nets = append(nets, &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)})
+		}
+	}
+	return nets
+}
+
+func ipInTrusted(ip net.IP, nets []*net.IPNet) bool {
+	for _, n := range nets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// rateLimitKey returns a limiter KeyGenerator that resolves the real client
+// IP. Requests not coming from a trusted proxy are keyed by the direct peer
+// address. For requests from a trusted proxy, the client is the rightmost
+// non-trusted IP in X-Forwarded-For, so a client-supplied header can neither
+// forge nor rotate the key.
+func rateLimitKey(trusted []*net.IPNet) func(*fiber.Ctx) string {
+	return func(c *fiber.Ctx) string {
+		peer := c.Context().RemoteIP()
+		if len(trusted) == 0 || !ipInTrusted(peer, trusted) {
+			return peer.String()
+		}
+		parts := strings.Split(c.Get(fiber.HeaderXForwardedFor), ",")
+		for i := len(parts) - 1; i >= 0; i-- {
+			ip := net.ParseIP(strings.TrimSpace(parts[i]))
+			if ip == nil {
+				break
+			}
+			if ipInTrusted(ip, trusted) {
+				continue
+			}
+			return ip.String()
+		}
+		return peer.String()
+	}
 }
 
 // customErrorHandler handles errors globally
@@ -165,9 +252,17 @@ func customErrorHandler(c *fiber.Ctx, err error) error {
 		message = e.Message
 	}
 
-	// Rate limit responses should hint when to retry
-	if code == fiber.StatusTooManyRequests {
-		c.Set("Retry-After", "60")
+	// Rate limit responses should hint when to retry; the limiter middleware
+	// already sets the header from its own expiration, so only fill it in
+	// when it is missing.
+	if code == fiber.StatusTooManyRequests && c.GetRespHeader(fiber.HeaderRetryAfter) == "" {
+		c.Set(fiber.HeaderRetryAfter, "60")
+	}
+
+	// Log unexpected failures (non-Fiber errors and 5xx) so production
+	// incidents are visible; expected client errors (4xx) stay off the log.
+	if _, isFiberErr := err.(*fiber.Error); !isFiberErr || code >= 500 {
+		log.Printf("request error: method=%s path=%s status=%d err=%v", c.Method(), c.Path(), code, err)
 	}
 
 	// Return JSON error response

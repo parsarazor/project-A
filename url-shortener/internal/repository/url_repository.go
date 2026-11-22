@@ -122,14 +122,6 @@ func (r *URLRepository) IncrementClickCountByShortCode(shortCode string) error {
 	return r.db.Model(&model.URL{}).Where("short_code = ?", shortCode).UpdateColumn("click_count", gorm.Expr("click_count + ?", 1)).Error
 }
 
-func (r *URLRepository) ShortCodeExists(shortCode string) (bool, error) {
-	var count int64
-	if err := r.db.Model(&model.URL{}).Where("short_code = ?", shortCode).Count(&count).Error; err != nil {
-		return false, err
-	}
-	return count > 0, nil
-}
-
 func (r *URLRepository) Deactivate(id uuid.UUID) error {
 	result := r.db.Model(&model.URL{}).Where("id = ?", id).Update("is_active", false)
 	if result.Error != nil {

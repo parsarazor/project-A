@@ -117,12 +117,13 @@ func (h *URLHandler) Redirect(c *fiber.Ctx) error {
 		return utils.InternalError(c, "Failed to retrieve URL")
 	}
 
-	// Increment click count asynchronously (Zero Network Overhead approach)
-	// This runs in a goroutine so the redirect happens immediately
+	// Increment click count through the bounded background queue so the
+	// redirect returns immediately (never blocks, never spawns goroutines)
 	h.urlService.IncrementClickCountAsync(shortCode)
 
-	// Redirect to original URL (301 Moved Permanently)
-	return c.Redirect(url.OriginalURL, fiber.StatusMovedPermanently)
+	// Redirect to original URL (302 Found - temporary, so an updated
+	// destination takes effect immediately instead of being cached forever)
+	return c.Redirect(url.OriginalURL, fiber.StatusFound)
 }
 
 // DeleteURL handles DELETE /api/v1/urls/{id}
